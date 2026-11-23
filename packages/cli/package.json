@@ -1,13 +1,39 @@
+
 {
   "name": "@nexus-orm/cli",
   "version": "0.1.0",
   "description": "CLI and migration toolkit for Project Nexus ORM",
+  "author": {
+    "name": "Sonikki",
+    "url": "https://sonikki.gg"
+  },
+  "license": "MIT",
+  "homepage": "https://sonikki.gg",
+  "repository": {
+    "type": "git",
+    "url": "YOUR_GITHUB_REPOSITORY_URL"
+  },
+  "bugs": {
+    "url": "YOUR_GITHUB_ISSUES_URL"
+  },
+  "keywords": [
+    "nexus",
+    "orm",
+    "cli",
+    "database",
+    "migrations",
+    "typescript"
+  ],
   "type": "module",
   "bin": {
     "nexus": "./bin/nexus.mjs"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "files": [
+    "bin/",
+    "dist/"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json"
   },
@@ -15,3 +41,4 @@
     "@nexus-orm/core": "0.1.0"
   }
 }
+
