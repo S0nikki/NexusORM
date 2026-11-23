@@ -1,27 +1,8 @@
-
 {
-  "name": "nexus-orm",
-  "version": "0.1.0",
-  "description": "A lightweight, cross-platform ORM with a TypeScript client and Go execution engine.",
+  "name": "nexus-orm-workspace",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "author": {
-    "name": "Sonikki",
-    "url": "https://sonikki.gg"
-  },
-  "keywords": [
-    "orm",
-    "database",
-    "typescript",
-    "go",
-    "sqlite",
-    "postgres",
-    "mysql",
-    "database-toolkit"
-  ],
-  "engines": {
-    "node": ">=20.0.0"
-  },
   "workspaces": [
     "packages/*"
   ],
@@ -38,11 +19,9 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "typescript": "^5.6.0",
-    "vitest": "^2.1.0",
+    "vitest": "^2.1.0"
   },
-  "dependencencies": {
-    "@nexus-orm/core": "0.1.0",
-    "@nexus-orm/cli": "0.1.0"
+  "engines": {
+    "node": ">=20.0.0"
   }
 }
-

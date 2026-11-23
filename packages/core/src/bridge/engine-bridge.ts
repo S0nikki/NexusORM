@@ -1,12 +1,15 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import { NexusError, type ProtocolErrorDetail } from "../errors/index.js";
+import { NativeSqliteExecutor } from "./native-executor.js";
 
 export const PROTOCOL_VERSION = 1;
-export const CLIENT_VERSION = "0.1.0";
+export const CLIENT_VERSION = "0.2.0";
+
+export type ExecutionMode = "auto" | "native" | "go";
 
 interface PendingRequest {
   resolve: (value: any) => void;
@@ -16,6 +19,8 @@ interface PendingRequest {
 
 export interface BridgeOptions {
   binaryPath?: string;
+  executionMode?: ExecutionMode;
+  dialect?: "postgres" | "sqlite" | "mysql";
   defaultTimeoutMs?: number;
   maxRestarts?: number;
   onLog?: (line: string) => void;
@@ -23,6 +28,7 @@ export interface BridgeOptions {
 
 export class EngineBridge {
   private proc: ChildProcessWithoutNullStreams | null = null;
+  private nativeExecutor: NativeSqliteExecutor | null = null;
   private pending = new Map<string, PendingRequest>();
   private reqCounter = 0;
   private shuttingDown = false;
@@ -30,11 +36,15 @@ export class EngineBridge {
   private readonly maxRestarts: number;
   private readonly defaultTimeoutMs: number;
   private readonly binaryPath: string;
+  private readonly executionMode: ExecutionMode;
+  private readonly dialect: string;
   private readonly onLog?: (line: string) => void;
   private lastInitReplay?: () => Promise<void>;
 
   constructor(opts: BridgeOptions = {}) {
     this.binaryPath = opts.binaryPath ?? EngineBridge.resolveDefaultBinaryPath();
+    this.executionMode = opts.executionMode ?? "auto";
+    this.dialect = opts.dialect ?? "sqlite";
     this.defaultTimeoutMs = opts.defaultTimeoutMs ?? 15_000;
     this.maxRestarts = opts.maxRestarts ?? 3;
     this.onLog = opts.onLog;
@@ -55,7 +65,38 @@ export class EngineBridge {
         return candidate;
       }
     }
-    return candidates[0] ?? path.resolve(process.cwd(), "packages/core/bin/nexus-engine");
+    const ext = process.platform === "win32" ? ".exe" : "";
+    return candidates[0] ?? path.resolve(process.cwd(), "packages/core/bin/nexus-engine" + ext);
+  }
+
+  private shouldUseNative(): boolean {
+    if (this.executionMode === "native") return true;
+    if (this.executionMode === "go") return false;
+    // In "auto" mode: use zero-IPC native execution for SQLite when Go binary is absent
+    return this.dialect === "sqlite" && !fs.existsSync(this.binaryPath);
+  }
+
+  private tryAutoBuildGoBinary(): boolean {
+    const currentDir = path.dirname(fileURLToPath(import.meta.url));
+    const engineDirs = [
+      path.resolve(process.cwd(), "engine"),
+      path.resolve(currentDir, "../../../../engine"),
+    ];
+    for (const engineDir of engineDirs) {
+      if (fs.existsSync(path.join(engineDir, "go.mod"))) {
+        try {
+          fs.mkdirSync(path.dirname(this.binaryPath), { recursive: true });
+          execSync(`go build -o "${this.binaryPath}" ./cmd/nexus-engine`, {
+            cwd: engineDir,
+            stdio: "ignore",
+          });
+          return fs.existsSync(this.binaryPath);
+        } catch {
+          return false;
+        }
+      }
+    }
+    return false;
   }
 
   public setReplayHook(hook: () => Promise<void>): void {
@@ -63,13 +104,27 @@ export class EngineBridge {
   }
 
   public async start(): Promise<void> {
-    if (this.proc) return;
+    if (this.proc || this.nativeExecutor) return;
+
+    if (this.shouldUseNative()) {
+      this.nativeExecutor = new NativeSqliteExecutor();
+      return;
+    }
+
     if (!fs.existsSync(this.binaryPath)) {
-      throw new NexusError({
-        code: "NEXUS_ENGINE_CRASHED",
-        message: `Nexus Go engine binary not found at ${this.binaryPath}. Run 'npm run build:go' first.`,
-        retryable: false,
-      });
+      const built = this.tryAutoBuildGoBinary();
+      if (!built && this.dialect === "sqlite") {
+        // Seamlessly fall back to in-process native SQLite execution if Go is not installed
+        this.nativeExecutor = new NativeSqliteExecutor();
+        return;
+      }
+      if (!built) {
+        throw new NexusError({
+          code: "NEXUS_ENGINE_CRASHED",
+          message: `Nexus Go engine binary not found at ${this.binaryPath}.`,
+          retryable: false,
+        });
+      }
     }
 
     this.shuttingDown = false;
@@ -171,9 +226,14 @@ export class EngineBridge {
     params: unknown = {},
     timeoutMs: number = this.defaultTimeoutMs
   ): Promise<TResult> {
-    if (!this.proc && method !== "engine.handshake") {
+    if (!this.proc && !this.nativeExecutor && method !== "engine.handshake") {
       await this.start();
     }
+
+    if (this.nativeExecutor) {
+      return this.nativeExecutor.handleRequest(method, params as Record<string, any>) as Promise<TResult>;
+    }
+
     if (!this.proc) {
       throw new NexusError({
         code: "NEXUS_ENGINE_CRASHED",
@@ -223,6 +283,11 @@ export class EngineBridge {
 
   public async stop(): Promise<void> {
     this.shuttingDown = true;
+    if (this.nativeExecutor) {
+      this.nativeExecutor.close();
+      this.nativeExecutor = null;
+      return;
+    }
     if (!this.proc) return;
     try {
       await this.request("engine.shutdown", {}, 2000);

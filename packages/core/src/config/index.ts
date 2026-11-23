@@ -26,6 +26,7 @@ export const LoggingConfigSchema = z.object({
 
 export const NexusConfigSchema = z.object({
   dialect: z.enum(["postgres", "sqlite", "mysql"]),
+  executionMode: z.enum(["auto", "native", "go"]).default("auto"),
   env: z.enum(["development", "production", "test"]).default("development"),
   connection: ConnectionConfigSchema,
   models: z.string().default("./src/models"),

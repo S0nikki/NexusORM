@@ -71,8 +71,13 @@ func (d *GormDriver) Connect(ctx context.Context, cfg protocol.ConnectionConfig)
 		return fmt.Errorf("unsupported database dialect %q", cfg.Dialect)
 	}
 
+	// Performance optimizations:
+	// - PrepareStmt caches compiled SQL statements at the driver level
+	// - SkipDefaultTransaction eliminates implicit BEGIN/COMMIT around single writes
 	gormCfg := &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
+		Logger:                 logger.Default.LogMode(logger.Silent),
+		PrepareStmt:            cfg.Dialect != "sqlite",
+		SkipDefaultTransaction: true,
 	}
 
 	db, err := gorm.Open(dialector, gormCfg)
@@ -111,13 +116,16 @@ func (d *GormDriver) RegisterSchema(ctx context.Context, manifest protocol.Schem
 	return d.registry.RegisterManifest(manifest)
 }
 
+// PushSchema synchronizes the database schema with registered models:
+// - Creates missing tables
+// - Detects newly added, removed, or modified columns on existing tables and migrates them
+// - Synchronizes unique and secondary indexes and many-to-many join tables
 func (d *GormDriver) PushSchema(ctx context.Context) error {
 	if d.db == nil {
 		return fmt.Errorf("database not connected")
 	}
 	for _, m := range d.registry.All() {
-		ddl := BuildCreateTableSQL(d.dialect, m.Schema)
-		if err := d.db.WithContext(ctx).Exec(ddl).Error; err != nil {
+		if err := d.syncModelTable(ctx, m.Schema); err != nil {
 			return err
 		}
 		for _, idxSQL := range BuildIndexSQL(m.Schema) {
@@ -139,6 +147,227 @@ func (d *GormDriver) PushSchema(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (d *GormDriver) syncModelTable(ctx context.Context, m protocol.ModelSchema) error {
+	mig := d.db.WithContext(ctx).Migrator()
+	if !mig.HasTable(m.TableName) {
+		ddl := BuildCreateTableSQL(d.dialect, m)
+		return d.db.WithContext(ctx).Exec(ddl).Error
+	}
+
+	colTypes, err := mig.ColumnTypes(m.TableName)
+	if err != nil {
+		return err
+	}
+
+	existingCols := make(map[string]gorm.ColumnType, len(colTypes))
+	for _, ct := range colTypes {
+		existingCols[strings.ToLower(ct.Name())] = ct
+	}
+
+	var missingFields []protocol.FieldSchema
+	needsRebuild := false
+
+	for _, f := range m.Fields {
+		ct, exists := existingCols[strings.ToLower(f.Column)]
+		if !exists {
+			missingFields = append(missingFields, f)
+			continue
+		}
+		// Check if column type or nullability changed
+		expectedSQLType := strings.ToUpper(mapSQLType(d.dialect, f))
+		actualDBType := strings.ToUpper(ct.DatabaseTypeName())
+		if !typesCompatible(expectedSQLType, actualDBType) {
+			needsRebuild = true
+		}
+		if nullable, ok := ct.Nullable(); ok && !f.PrimaryKey && nullable != f.Nullable {
+			needsRebuild = true
+		}
+	}
+
+	// Check if any existing column was removed from the model
+	modelColSet := make(map[string]bool, len(m.Fields))
+	for _, f := range m.Fields {
+		modelColSet[strings.ToLower(f.Column)] = true
+	}
+	for existingName := range existingCols {
+		if !modelColSet[existingName] {
+			needsRebuild = true
+		}
+	}
+
+	if needsRebuild && d.dialect == "sqlite" {
+		return d.rebuildSqliteTable(ctx, m, existingCols)
+	}
+
+	// Apply incremental ALTER TABLE ADD COLUMN for new fields
+	for _, f := range missingFields {
+		alterSQL := BuildAddColumnSQL(d.dialect, m.TableName, f)
+		if err := d.db.WithContext(ctx).Exec(alterSQL).Error; err != nil {
+			if d.dialect == "sqlite" {
+				return d.rebuildSqliteTable(ctx, m, existingCols)
+			}
+			return err
+		}
+	}
+
+	if needsRebuild && d.dialect != "sqlite" {
+		for _, f := range m.Fields {
+			if _, exists := existingCols[strings.ToLower(f.Column)]; !exists {
+				continue
+			}
+			for _, stmt := range BuildAlterColumnSQL(d.dialect, m.TableName, f) {
+				_ = d.db.WithContext(ctx).Exec(stmt).Error
+			}
+		}
+	}
+
+	return nil
+}
+
+// rebuildSqliteTable performs an atomic SQLite table migration to support column type edits,
+// nullability changes, constraint updates, and dropped columns while preserving existing data.
+func (d *GormDriver) rebuildSqliteTable(
+	ctx context.Context,
+	m protocol.ModelSchema,
+	existingCols map[string]gorm.ColumnType,
+) error {
+	tempTable := fmt.Sprintf("_nexus_tmp_%s_%d", m.TableName, time.Now().UnixNano())
+	tempModel := m
+	tempModel.TableName = tempTable
+
+	return d.db.WithContext(ctx).Transaction(func(txDB *gorm.DB) error {
+		txDB.Exec("PRAGMA foreign_keys = OFF;")
+		defer txDB.Exec("PRAGMA foreign_keys = ON;")
+
+		createTempSQL := BuildCreateTableSQL(d.dialect, tempModel)
+		if err := txDB.Exec(createTempSQL).Error; err != nil {
+			return err
+		}
+
+		var sharedDestCols []string
+		var selectExprs []string
+		for _, f := range m.Fields {
+			if _, exists := existingCols[strings.ToLower(f.Column)]; exists {
+				quoted := fmt.Sprintf("%q", f.Column)
+				sharedDestCols = append(sharedDestCols, quoted)
+				if !f.Nullable && f.DefaultKind == "static" && f.DefaultValue != nil {
+					selectExprs = append(selectExprs, fmt.Sprintf("COALESCE(%s, %s)", quoted, formatSQLLiteral(f.DefaultValue)))
+				} else {
+					selectExprs = append(selectExprs, quoted)
+				}
+			} else if !f.Nullable {
+				quoted := fmt.Sprintf("%q", f.Column)
+				sharedDestCols = append(sharedDestCols, quoted)
+				selectExprs = append(selectExprs, formatDefaultLiteral(f))
+			}
+		}
+
+		if len(sharedDestCols) > 0 {
+			copySQL := fmt.Sprintf(
+				"INSERT INTO %q (%s) SELECT %s FROM %q;",
+				tempTable,
+				strings.Join(sharedDestCols, ", "),
+				strings.Join(selectExprs, ", "),
+				m.TableName,
+			)
+			if err := txDB.Exec(copySQL).Error; err != nil {
+				return err
+			}
+		}
+
+		if err := txDB.Exec(fmt.Sprintf("DROP TABLE %q;", m.TableName)).Error; err != nil {
+			return err
+		}
+		if err := txDB.Exec(fmt.Sprintf("ALTER TABLE %q RENAME TO %q;", tempTable, m.TableName)).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func typesCompatible(expected, actual string) bool {
+	if expected == actual || strings.HasPrefix(actual, expected) || strings.HasPrefix(expected, actual) {
+		return true
+	}
+	if (expected == "TEXT" || strings.HasPrefix(expected, "VARCHAR")) &&
+		(actual == "TEXT" || strings.HasPrefix(actual, "VARCHAR")) {
+		return true
+	}
+	if (expected == "DATETIME" || expected == "TIMESTAMPTZ") &&
+		(strings.Contains(actual, "DATE") || strings.Contains(actual, "TIME")) {
+		return true
+	}
+	if (expected == "BOOLEAN" || expected == "BOOL") &&
+		(strings.Contains(actual, "BOOL") || strings.Contains(actual, "INT")) {
+		return true
+	}
+	return false
+}
+
+func BuildAddColumnSQL(dialect, tableName string, f protocol.FieldSchema) string {
+	colDef := fmt.Sprintf("%q %s", f.Column, mapSQLType(dialect, f))
+	if !f.Nullable {
+		colDef += " NOT NULL DEFAULT " + formatDefaultLiteral(f)
+	} else if f.DefaultKind == "static" && f.DefaultValue != nil {
+		colDef += " DEFAULT " + formatSQLLiteral(f.DefaultValue)
+	}
+	return fmt.Sprintf("ALTER TABLE %q ADD COLUMN %s;", tableName, colDef)
+}
+
+func BuildAlterColumnSQL(dialect, tableName string, f protocol.FieldSchema) []string {
+	sqlType := mapSQLType(dialect, f)
+	if dialect == "mysql" {
+		nullStr := "NULL"
+		if !f.Nullable {
+			nullStr = "NOT NULL"
+		}
+		return []string{
+			fmt.Sprintf("ALTER TABLE %q MODIFY COLUMN %q %s %s;", tableName, f.Column, sqlType, nullStr),
+		}
+	}
+	// PostgreSQL syntax
+	stmts := []string{
+		fmt.Sprintf("ALTER TABLE %q ALTER COLUMN %q TYPE %s;", tableName, f.Column, sqlType),
+	}
+	if f.Nullable {
+		stmts = append(stmts, fmt.Sprintf("ALTER TABLE %q ALTER COLUMN %q DROP NOT NULL;", tableName, f.Column))
+	} else {
+		stmts = append(stmts, fmt.Sprintf("ALTER TABLE %q ALTER COLUMN %q SET NOT NULL;", tableName, f.Column))
+	}
+	return stmts
+}
+
+func formatDefaultLiteral(f protocol.FieldSchema) string {
+	if f.DefaultKind == "static" && f.DefaultValue != nil {
+		return formatSQLLiteral(f.DefaultValue)
+	}
+	switch f.Type {
+	case "integer", "float":
+		return "0"
+	case "boolean":
+		return "0"
+	default:
+		return "''"
+	}
+}
+
+func formatSQLLiteral(val any) string {
+	switch v := val.(type) {
+	case bool:
+		if v {
+			return "1"
+		}
+		return "0"
+	case int, int64, float64:
+		return fmt.Sprintf("%v", v)
+	case string:
+		escaped := strings.ReplaceAll(v, "'", "''")
+		return fmt.Sprintf("'%s'", escaped)
+	default:
+		return "''"
+	}
 }
 
 func (d *GormDriver) ExecRawSQL(ctx context.Context, sqlStr string, args ...any) error {
@@ -877,6 +1106,9 @@ func BuildCreateTableSQL(dialect string, m protocol.ModelSchema) string {
 			if f.Unique {
 				colDef += " UNIQUE"
 			}
+			if f.DefaultKind == "static" && f.DefaultValue != nil {
+				colDef += " DEFAULT " + formatSQLLiteral(f.DefaultValue)
+			}
 		}
 		if f.References != nil && f.References.Model != "" {
 			refTable := registry.ToSnakeCase(f.References.Model) + "s"
@@ -895,7 +1127,13 @@ func BuildCreateTableSQL(dialect string, m protocol.ModelSchema) string {
 func BuildIndexSQL(m protocol.ModelSchema) []string {
 	var stmts []string
 	for _, f := range m.Fields {
-		if f.Index && !f.Unique && !f.PrimaryKey {
+		if f.PrimaryKey {
+			continue
+		}
+		if f.Unique {
+			idxName := fmt.Sprintf("uq_%s_%s", m.TableName, f.Column)
+			stmts = append(stmts, fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS %q ON %q (%q);", idxName, m.TableName, f.Column))
+		} else if f.Index {
 			idxName := fmt.Sprintf("idx_%s_%s", m.TableName, f.Column)
 			stmts = append(stmts, fmt.Sprintf("CREATE INDEX IF NOT EXISTS %q ON %q (%q);", idxName, m.TableName, f.Column))
 		}

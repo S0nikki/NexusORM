@@ -12,6 +12,12 @@ import {
   type WhereFilter,
 } from "../query/index.js";
 import {
+  buildModelMeta,
+  compileSelectSQL,
+  type CompiledSQLQuery,
+  type InternalModelMeta,
+} from "../query/sql-compiler.js";
+import {
   serializeSchema,
   type AnyModelDefinition,
   type InferInsertModel,
@@ -49,12 +55,16 @@ export interface DeleteArgs<TModel extends AnyModelDefinition> {
 }
 
 export class ModelDelegate<TModel extends AnyModelDefinition> {
+  private readonly meta: InternalModelMeta;
+
   constructor(
     private readonly model: TModel,
     private readonly bridge: EngineBridge,
     private readonly ensureConnected: () => Promise<void>,
     private readonly txId?: string
-  ) {}
+  ) {
+    this.meta = buildModelMeta(model);
+  }
 
   private async exec(operation: string, payload: Record<string, unknown>) {
     await this.ensureConnected();
@@ -63,6 +73,20 @@ export class ModelDelegate<TModel extends AnyModelDefinition> {
       model: this.model.name,
       operation,
       ...payload,
+    });
+  }
+
+  /**
+   * Compiles a query directly to parameterized SQL and bind parameters in TypeScript
+   * (just like Drizzle's .toSQL()) without spawning or hitting the Go engine.
+   */
+  toSQL(args: FindManyArgs<TModel> = {}): CompiledSQLQuery {
+    return compileSelectSQL(this.meta, {
+      where: normalizeWhereToAST(args.where as Record<string, unknown>),
+      select: normalizeSelectToAST(args.select),
+      orderBy: normalizeOrderByToAST(args.orderBy),
+      limit: args.limit,
+      offset: args.offset,
     });
   }
 
@@ -201,6 +225,8 @@ export class BaseNexusClient<TModels extends Record<string, AnyModelDefinition>>
       existingBridge ??
       new EngineBridge({
         binaryPath: opts.config.engineBinaryPath,
+        executionMode: opts.config.executionMode,
+        dialect: opts.config.dialect,
       });
 
     if (!existingBridge) {
@@ -239,6 +265,8 @@ export class BaseNexusClient<TModels extends Record<string, AnyModelDefinition>>
 
   async $pushSchema(): Promise<void> {
     await this.$connect();
+    const manifest = serializeSchema(Object.values(this.$models));
+    await this.$bridge.request("schema.register", manifest);
     await this.$bridge.request("schema.push", {});
   }
 

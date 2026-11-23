@@ -39,6 +39,14 @@ export {
 } from "./query/index.js";
 
 export {
+  buildModelMeta,
+  compileFilterAST,
+  compileSelectSQL,
+  type CompiledSQLQuery,
+  type InternalModelMeta,
+} from "./query/sql-compiler.js";
+
+export {
   createClient,
   BaseNexusClient,
   ModelDelegate,
@@ -51,6 +59,7 @@ export {
   CLIENT_VERSION,
   PROTOCOL_VERSION,
   type BridgeOptions,
+  type ExecutionMode,
 } from "./bridge/engine-bridge.js";
 
 export {

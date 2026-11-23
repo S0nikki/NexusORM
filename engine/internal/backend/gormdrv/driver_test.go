@@ -68,7 +68,6 @@ func TestCRUDAndRelations(t *testing.T) {
 	defer drv.Close()
 	ctx := context.Background()
 
-	// 1. Create User
 	userRes, err := drv.ExecuteQuery(ctx, protocol.QueryAST{
 		Model:     "User",
 		Operation: "create",
@@ -85,7 +84,6 @@ func TestCRUDAndRelations(t *testing.T) {
 		t.Fatalf("expected generated UUID id, got: %v", userRes.Row["id"])
 	}
 
-	// 2. Create Post linked to User
 	_, err = drv.ExecuteQuery(ctx, protocol.QueryAST{
 		Model:     "Post",
 		Operation: "create",
@@ -99,7 +97,6 @@ func TestCRUDAndRelations(t *testing.T) {
 		t.Fatalf("create post failed: %v", err)
 	}
 
-	// 3. FindMany with eager loading (User -> posts)
 	findRes, err := drv.ExecuteQuery(ctx, protocol.QueryAST{
 		Model:     "User",
 		Operation: "findMany",
@@ -119,7 +116,6 @@ func TestCRUDAndRelations(t *testing.T) {
 		t.Fatalf("expected 1 eager-loaded post, got: %#v", findRes.Rows[0]["posts"])
 	}
 
-	// 4. Transaction Commit & Rollback
 	txID, err := drv.BeginTx(ctx, protocol.TxOptions{TimeoutMs: 5000})
 	if err != nil {
 		t.Fatalf("begin tx failed: %v", err)
@@ -147,6 +143,79 @@ func TestCRUDAndRelations(t *testing.T) {
 	})
 	if err != nil || existsRes.Exists {
 		t.Fatalf("expected rolled back user not to exist")
+	}
+}
+
+func TestSchemaPushColumnEvolution(t *testing.T) {
+	reg := registry.NewRegistry()
+	drv := gormdrv.NewGormDriver(reg)
+	defer drv.Close()
+	ctx := context.Background()
+
+	_ = drv.Connect(ctx, protocol.ConnectionConfig{Dialect: "sqlite", URL: ":memory:"})
+
+	// V1 of User model: only id and username
+	v1 := protocol.SchemaManifest{
+		Models: []protocol.ModelSchema{
+			{
+				Name: "User",
+				Fields: []protocol.FieldSchema{
+					{Name: "id", Type: "uuid", PrimaryKey: true, DefaultKind: "uuid"},
+					{Name: "username", Type: "string", Unique: true},
+				},
+			},
+		},
+	}
+	if err := drv.RegisterSchema(ctx, v1); err != nil {
+		t.Fatalf("v1 register failed: %v", err)
+	}
+	if err := drv.PushSchema(ctx); err != nil {
+		t.Fatalf("v1 push failed: %v", err)
+	}
+
+	// Insert a record under V1
+	_, err := drv.ExecuteQuery(ctx, protocol.QueryAST{
+		Model:     "User",
+		Operation: "create",
+		Data:      map[string]any{"username": "linus"},
+	})
+	if err != nil {
+		t.Fatalf("v1 create failed: %v", err)
+	}
+
+	// V2 of User model: add 'role' (with default) and 'points' (nullable integer)
+	v2 := protocol.SchemaManifest{
+		Models: []protocol.ModelSchema{
+			{
+				Name: "User",
+				Fields: []protocol.FieldSchema{
+					{Name: "id", Type: "uuid", PrimaryKey: true, DefaultKind: "uuid"},
+					{Name: "username", Type: "string", Unique: true},
+					{Name: "role", Type: "string", DefaultKind: "static", DefaultValue: "member"},
+					{Name: "points", Type: "integer", Nullable: true},
+				},
+			},
+		},
+	}
+	if err := drv.RegisterSchema(ctx, v2); err != nil {
+		t.Fatalf("v2 register failed: %v", err)
+	}
+	if err := drv.PushSchema(ctx); err != nil {
+		t.Fatalf("v2 push failed: %v", err)
+	}
+
+	// Update existing row with new columns
+	updated, err := drv.ExecuteQuery(ctx, protocol.QueryAST{
+		Model:     "User",
+		Operation: "update",
+		Where:     &protocol.FilterNode{Field: "username", Op: "eq", Value: "linus"},
+		Data:      map[string]any{"role": "maintainer", "points": 99},
+	})
+	if err != nil {
+		t.Fatalf("v2 update with new columns failed: %v", err)
+	}
+	if updated.Row["role"] != "maintainer" {
+		t.Fatalf("expected updated role 'maintainer', got %v", updated.Row["role"])
 	}
 }
 
@@ -185,7 +254,6 @@ func TestMigrationsLifecycle(t *testing.T) {
 		t.Fatalf("apply up failed: %v (applied=%v)", err, applied)
 	}
 
-	// Tamper with migration file to verify conflict detection
 	_ = os.WriteFile(filePath, []byte("-- +nexus Up\nSELECT 1;\n"), 0644)
 	_, err = mig.ApplyUp(ctx, tmpDir)
 	if err == nil {
