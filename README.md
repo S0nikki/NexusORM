@@ -2,6 +2,9 @@
 
 Nexus is a Go-powered ORM and database management toolkit with a TypeScript-first developer experience for Node.js applications.
 
+> [!IMPORTANT]
+> The SQL in this project was made with AI, and some of the javascript was too so I would say this is 79% human made. The model used with some of this was Gemini Argon 4
+
 ## Architecture
 
 - **TypeScript Layer (`@nexus-orm/core`, `@nexus-orm/cli`)**: Provides `defineConfig()`, `defineModel()`, `field.*`, `relation.define()`, static `$InferSelect` / `$InferInsert` type inference, query AST construction, and the CLI.
