@@ -1,0 +1,27 @@
+{
+  "name": "nexus-orm-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build:go": "node -e \"const {execSync}=require('node:child_process');const ext=process.platform==='win32'?'.exe':'';execSync('go build -o ../packages/core/bin/nexus-engine'+ext+' ./cmd/nexus-engine',{cwd:'engine',stdio:'inherit'});\"",
+    "build:ts": "npm run build -w @nexus-orm/core && npm run build -w @nexus-orm/cli",
+    "build": "npm run build:go && npm run build:ts",
+    "test:go": "cd engine && go test -v ./...",
+    "test:ts": "npx vitest run",
+    "test": "npm run test:go && npm run test:ts",
+    "nexus": "bun packages/cli/bin/nexus.mjs",
+    "playground": "bun run playground/index.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

@@ -1,0 +1,9 @@
+node_modules/
+dist/
+packages/core/bin/nexus-engine*
+*.db
+*.sqlite
+*.sqlite3
+.env
+coverage/
+.DS_Store

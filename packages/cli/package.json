@@ -1,0 +1,17 @@
+{
+  "name": "@nexus-orm/cli",
+  "version": "0.1.0",
+  "description": "CLI and migration toolkit for Project Nexus ORM",
+  "type": "module",
+  "bin": {
+    "nexus": "./bin/nexus.mjs"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@nexus-orm/core": "0.1.0"
+  }
+}
